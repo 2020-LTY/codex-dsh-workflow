@@ -1,0 +1,11 @@
+node_modules/
+dist/
+.env
+.env.*
+*.log
+.compat/
+live-tests/
+endpoint.json
+ownership.json
+token
+token.*
