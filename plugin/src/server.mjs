@@ -3,6 +3,11 @@ import { randomBytes, randomUUID, createHash, timingSafeEqual } from 'node:crypt
 import { mkdir, readFile, writeFile, rename, unlink, stat } from 'node:fs/promises';
 import { homedir } from 'node:os';
 import { join, resolve, isAbsolute } from 'node:path';
+import { modelAdapter, pickSelection, matchesSelection, selectionView } from './model-selection.mjs';
+import { createCapabilities } from './capabilities.mjs';
+import { capabilityRules } from './capability-policy.mjs';
+
+const pluginVersion = '0.5.0';
 
 class ApiError extends Error {
   constructor(status, message) { super(message); this.status = status; }
@@ -99,6 +104,14 @@ export async function startBridge(ctx, config = {}) {
   const pending = new Map();
   const requests = new Set();
   const stop = new AbortController();
+  const models = modelAdapter(ctx);
+  const capabilities = { sessionModelSelection: models.supported, modelReadback: true, selectionScope: 'session', adapter: 'desktop-0.2.1-rc.1' };
+  const validateSelection = selection => {
+    fields(selection, ['provider', 'model', 'reasoningEffort']);
+    text(selection.provider, 'provider', 200);
+    text(selection.model, 'model', 200);
+    if (selection.reasoningEffort !== undefined) text(selection.reasoningEffort, 'reasoningEffort', 100);
+  };
   const serialize = fn => {
     const job = tail.then(() => { requireValue(!closed, 'bridge shutting down', 503); return fn(); });
     tail = job.catch(() => {});
@@ -114,6 +127,11 @@ export async function startBridge(ctx, config = {}) {
     requireValue(Object.hasOwn(state.sessions, id), 'session not owned by this bridge', 403);
     return state.sessions[id];
   };
+  const extensions = await createCapabilities(ctx, {
+    stateDir, fail: requireValue, fields, text, requestKey, owned,
+    busy: () => Object.keys(state.sessions).some(id => ctx.agents.get(id)?.status === 'running'),
+  });
+  Object.assign(capabilities, extensions.supported);
   const status = async (id, requestId, includeToolOutput = false) => {
     const record = owned(id);
     const observation = await ctx.sessionQuery.observeSession(id, { signal: stop.signal, projectionMode: 'none' });
@@ -123,6 +141,12 @@ export async function startBridge(ctx, config = {}) {
       const agent = ctx.agents.get(id);
       const events = [...observation.events];
       const task = current ? summarize(events, current, agent?.status === 'running', outputChars) : { state: 'created', executionEnded: false };
+      const view = selectionView(events);
+      const requested = current ? record.requestModels?.[current] ?? null : record.modelSelection ?? null;
+      const headers = task.receipt ? events.filter(e => e.seq >= task.fromSeq && e.type === 'request/header') : [];
+      task.modelUsage = headers.map(e => ({ seq: e.seq, selection: pickSelection(e.data.header?.config) }));
+      task.modelExpected = requested;
+      task.modelVerified = requested && headers.length ? task.modelUsage.every(h => matchesSelection(h.selection, requested)) : null;
       if (includeToolOutput && task.receipt) {
         task.recentToolOutputs = events.filter(e => e.seq >= task.fromSeq && e.type === 'tool/result').slice(-3).map(e => {
           return toolOutput(e.data.message, Math.floor(outputChars / 3), e.seq);
@@ -131,6 +155,7 @@ export async function startBridge(ctx, config = {}) {
       return {
         sessionId: id, requestId: current ?? null,
         agentStatus: agent?.status ?? 'inactive', interactionMode: record.interactionMode,
+        modelSelection: { requested: record.modelSelection ?? null, ...view },
         task,
         pending: [...pending.values()].filter(p => p.sessionId === id).map(p => p.view),
       };
@@ -182,19 +207,25 @@ export async function startBridge(ctx, config = {}) {
   };
 
   async function route(method, path, body, query) {
-    if (method === 'GET' && path === '/v1/health') return { protocol: 1, instanceId, transport: 'same-host-controllers' };
+    if (method === 'GET' && path === '/v1/health') return { protocol: 1, pluginVersion, instanceId, transport: 'same-host-controllers', capabilities: { ...capabilities, ...extensions.refresh() } };
     if (method === 'GET' && path === '/v1/catalog') {
       const presets = ctx.get?.('agentPresets');
-      return { models: await ctx.sessionController.modelCatalog(), presets: presets ? await presets.remoteExportList() : null };
+      return { models: await ctx.sessionController.modelCatalog(), presets: presets ? await presets.remoteExportList() : null, capabilities: { ...capabilities, ...extensions.refresh() } };
+    }
+    if (path.startsWith('/v1/plugins') || path === '/v1/capabilities/plan') {
+      const result = await extensions.route(method, path, body);
+      requireValue(result !== undefined, 'route not found', 404);
+      return result;
     }
     if (method === 'GET' && path === '/v1/sessions') return { sessions: Object.entries(state.sessions).map(([sessionId, r]) => ({ sessionId, title: r.title, cwd: r.cwd, interactionMode: r.interactionMode })) };
     if (method === 'POST' && path === '/v1/sessions') return serialize(async () => {
-      fields(body, ['requestId', 'cwd', 'title', 'agentPreset', 'interactionMode']);
+      fields(body, ['requestId', 'cwd', 'title', 'agentPreset', 'interactionMode', 'modelSelection', 'requirements']);
       const key = requestKey(body.requestId);
       const cwd = text(body.cwd, 'cwd');
       requireValue(isAbsolute(cwd) && (await stat(cwd)).isDirectory(), 'cwd must be an existing absolute directory');
       text(body.title, 'title', 200);
       if (body.agentPreset !== undefined) text(body.agentPreset, 'agentPreset', 200);
+      if (body.requirements !== undefined) requireValue(Array.isArray(body.requirements) && body.requirements.every(id => Object.hasOwn(capabilityRules, id)), 'unknown requirement');
       const interactionMode = body.interactionMode ?? 'desktop';
       requireValue(['api', 'desktop'].includes(interactionMode), 'invalid interactionMode');
       const fingerprint = hash(body);
@@ -204,22 +235,59 @@ export async function startBridge(ctx, config = {}) {
         if (create.result) return create.result;
       }
       else {
+        if (body.modelSelection !== undefined) {
+          validateSelection(body.modelSelection);
+          // 在创建会话前拒绝无效选择；省略时保留旧版的默认行为。
+          await models.resolve(body.modelSelection, requireValue);
+        }
         const sessionId = `session-${randomUUID()}`;
         create = state.creates[key] = { hash: fingerprint, sessionId };
-        state.sessions[sessionId] = { cwd, title: body.title, interactionMode, requests: {} };
+        state.sessions[sessionId] = { cwd, title: body.title, interactionMode, requests: {}, ...(body.requirements ? { requirements: body.requirements } : {}) };
         await save();
       }
       const workspace = await ctx.workspaceController.create({ path: cwd });
       const created = await ctx.sessionController.create({ workspaceId: workspace.workspace.workspaceId, sessionId: create.sessionId, ...(body.agentPreset ? { agentPreset: body.agentPreset } : {}) });
+      if (body.modelSelection !== undefined) {
+        validateSelection(body.modelSelection);
+        const selected = await models.resolve(body.modelSelection, requireValue);
+        await models.install(create.sessionId, selected, requireValue);
+        state.sessions[create.sessionId].modelSelection = selected;
+        const installed = (await status(create.sessionId)).modelSelection.next;
+        requireValue(installed && matchesSelection(installed, selected), 'model selection readback mismatch', 409);
+      }
       await ctx.sessionController.rename({ sessionId: create.sessionId, title: body.title });
-      create.result = { ...created, workspaceId: workspace.workspace.workspaceId, interactionMode };
+      create.result = { ...created, workspaceId: workspace.workspace.workspaceId, interactionMode, ...(body.modelSelection === undefined ? {} : { modelSelection: (await status(create.sessionId)).modelSelection }), ...(body.requirements ? { capabilityReadback: await extensions.session(create.sessionId, body.requirements) } : {}) };
       await save();
       return create.result;
     });
-    const match = /^\/v1\/sessions\/([^/]+)\/(status|prompt|cancel|answer|operation)$/.exec(path);
+    const match = /^\/v1\/sessions\/([^/]+)\/(status|prompt|cancel|answer|operation|model|capabilities)$/.exec(path);
     requireValue(match, 'route not found', 404);
     const id = decodeURIComponent(match[1]);
     const record = owned(id);
+    if (method === 'GET' && match[2] === 'capabilities') return extensions.session(id, record.requirements ?? []);
+    if (method === 'GET' && match[2] === 'model') return (await status(id)).modelSelection;
+    if (method === 'POST' && match[2] === 'model') return serialize(async () => {
+      fields(body, ['requestId', 'modelSelection']);
+      const key = requestKey(body.requestId);
+      validateSelection(body.modelSelection);
+      const fingerprint = hash(body);
+      const previous = record.modelRequests?.[key];
+      if (previous) {
+        requireValue(previous.hash === fingerprint, 'requestId reused with different model payload', 409);
+        return { ...previous.result, replayed: true, current: (await status(id)).modelSelection };
+      }
+      requireValue(ctx.agents.get(id)?.status !== 'running' && ![...pending.values()].some(p => p.sessionId === id), 'session busy', 409);
+      if (record.latestRequest) requireValue((await status(id)).task.executionEnded, 'prior prompt lacks completed receipt', 409);
+      const selected = await models.resolve(body.modelSelection, requireValue);
+      await models.install(id, selected, requireValue);
+      const current = (await status(id)).modelSelection;
+      requireValue(current.next && matchesSelection(current.next, selected), 'model selection readback mismatch', 409);
+      record.modelSelection = selected;
+      const result = { selected, scope: 'session', verified: true };
+      (record.modelRequests ??= {})[key] = { hash: fingerprint, result };
+      await save();
+      return result;
+    });
     if (method === 'GET' && match[2] === 'operation') {
       const p = pending.get(query.get('interactionId'));
       requireValue(p && p.sessionId === id && p.kind === 'approval', 'approval absent or already settled', 409);
@@ -245,6 +313,11 @@ export async function startBridge(ctx, config = {}) {
       else {
         requireValue(ctx.agents.get(id)?.status !== 'running', 'agent busy; wait or cancel first', 409);
         if (record.latestRequest) requireValue((await status(id)).task.executionEnded, 'prior prompt lacks completed receipt', 409);
+        if (record.modelSelection) {
+          const current = (await status(id)).modelSelection.next;
+          requireValue(current && matchesSelection(current, record.modelSelection), 'session model changed; select the intended model before prompting', 409);
+          (record.requestModels ??= {})[key] = record.modelSelection;
+        }
         record.requests[key] = fingerprint;
         record.latestRequest = key;
         await save();
@@ -303,6 +376,7 @@ export async function startBridge(ctx, config = {}) {
         stop.abort();
         for (const p of [...pending.values()]) p.abort();
         for (const fn of dispose) fn();
+        await extensions.close();
         server.closeAllConnections();
         await new Promise(ok => server.close(ok));
         await tail;

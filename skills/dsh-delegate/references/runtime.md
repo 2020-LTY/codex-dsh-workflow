@@ -50,7 +50,7 @@ preset 主要挂载 agent 工具/提示，sandbox、持久化、provider 及 hos
 
 - 短期优先 `--patch` overlay；长期组合可建单独 custom profile，从 `--from-default-profile headless` 等模板初始化。仅目标目录不存在时用创建参数，初始化后重试去掉。不要先插件管理意外建 base-only profile，再试图套模板。
 - patch 的 config 整体替换，不逐字段合并；保留所需字段与 `!!js` 表达式。新 row 用当前版本插入语法，不猜 row id；dump 与启动检查各证明对应事实。
-- profile 后还有 home patch，最后 argv overlays 优先；不改 home patch 为一个任务加能力，不跨 profile 推断插件状态。当前 desktop 是 Electron 保留名称，CLI 不管理/启动。
+- profile 后还有 home patch，最后 argv overlays 优先；不改 home patch 为一个任务加能力，不跨 profile 推断插件状态。desktop 运行由 Electron 管理，不用 CLI 启动它。插件管理 CLI 能否操作 desktop 以当前版本核实；运行中的 profile 优先用 Host 管理接口，不能以名称保留推断插件子命令也不可用。
 - 配置表达式与 MCP server 是可信代码。提示词允许列表不是真正访问控制；base workspace-write 仍允许部分读取/网络，sdk-minimal 当前固定 danger-full-access，名称 minimal 不代表更安全或便宜。
 - timeout-policy 是协作取消，部分 shell/FS 无其时限，不是整个任务硬期限。控制端拥有期限、取消/关闭与进程清理。
 - 模型/reasoning 从实际 provider catalog 选择，不固定过期型号。核实实际输出 cap 与 reasoning 设置，不能把部署默认视为适合小任务的预算；需要调整时用该接口支持的字段，不添加虚构 CLI 参数。SDK maxTokens 是每请求输出 cap，compaction 等另有用量；遥测不完整时说明计量范围。
@@ -63,7 +63,7 @@ headless 会话可以落盘到与 Desktop 相同的 home，但独立进程的 se
 
 有现成受支持的桌面/Host 控制入口时，优先让该 Host 创建并驱动会话，或用其明确支持的刷新/读取接口核实可见性。SDK/ACP 若仍是另起进程，也没有自动解决实时展示。没有该入口时记录“独立进程，桌面尚未确认可见”，向用户给出真实标题/id及刷新后可能位于未分组的定位方式；不宣称已在桌面显示，不静默重启正在运行的桌面。
 
-不得直接编辑 workspace.json、删除初始化标记、移动/改写历史 session、让 CLI 管理 reserved desktop profile，或为追求可见性重复执行原任务。需要实时跟踪但产品没有支持入口时，把它明确列为产品能力缺口；skill 无法替代跨进程会话发现与刷新。
+不得直接编辑 workspace.json、删除初始化标记、移动/改写历史 session、用不支持的 CLI 模式启动 desktop，或为追求可见性重复执行原任务。需要实时跟踪但产品没有支持入口时，把它明确列为产品能力缺口；skill 无法替代跨进程会话发现与刷新。
 
 ## 用量读取
 

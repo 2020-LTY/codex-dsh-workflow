@@ -8,17 +8,25 @@ import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import { fileURLToPath } from 'node:url';
 import { startBridge, summarize } from '../src/server.mjs';
+import { selectionView } from '../src/model-selection.mjs';
+import { prepare } from '../scripts/prepare.mjs';
+import { reassess } from '../scripts/reassess.mjs';
 
-async function fixture(t) {
+async function fixture(t, options = {}) {
   const dir = await mkdtemp(join(tmpdir(), 'dsh-control-'));
   const agents = new Map(), logs = new Map(), listeners = new Map();
   let admissions = 0, creations = 0, disposed = 0;
   const ctx = {
+    get(name) { return options.services?.[name] ?? (name === 'llm' ? { resolveCallConfig: async selection => ({ reasoningEffort: 'high', ...selection }) } : undefined); },
     agents: { get: id => agents.get(id) },
     on(name, fn) { listeners.set(name, fn); return () => listeners.delete(name); },
     workspaceController: { create: async ({ path }) => ({ workspace: { workspaceId: 'workspace-fixture', path } }) },
     sessionQuery: { observeSession: async id => ({ events: logs.get(id), [Symbol.dispose]() { disposed++; } }) },
     sessionController: {
+      agents: {
+        serializeImageAdmission: async (_agent, fn) => fn(),
+        selectForNextRequest(agent, selection) { logs.get(agent.id).push({ type: 'model/selection', seq: logs.get(agent.id).length, data: selection }); },
+      },
       create: async ({ sessionId }) => {
         creations++; agents.set(sessionId, { id: sessionId, status: 'idle' }); logs.set(sessionId, []);
         return { sessionId, agentPreset: 'default' };
@@ -34,9 +42,10 @@ async function fixture(t) {
         return { accepted: true };
       },
       cancel: async ({ sessionId }) => { agents.get(sessionId).status = 'idle'; return { cancelled: true }; },
-      modelCatalog: async () => ({ groups: [] }),
+      modelCatalog: async () => ({ routableProviders: ['fixture'], groups: [{ id: 'fixture', models: ['flash', 'pro'].map(id => ({ id, reasoning: { efforts: ['off', 'low', 'high', 'max'].map(id => ({ id })) } })) }] }),
     },
   };
+  if (options.unsupported) delete ctx.sessionController.agents;
   const bridge = await startBridge(ctx, { port: 0, stateDir: dir, outputChars: 100 });
   t.after(async () => { await bridge.close(); await rm(dir, { recursive: true, force: true }); });
   const call = async (path, body, headers = {}) => {
@@ -51,6 +60,68 @@ async function fixture(t) {
   };
   return { bridge, call, create, agents, logs, listeners, ctx, dir, counts: () => ({ admissions, creations, disposed }) };
 }
+
+test('HTTP capability management and resumable preparation use the supported Host services', async t => {
+  const bundles = []; let installs = 0;
+  const services = {
+    pluginManager: {
+      listBundles: async () => bundles, listPlugins: async () => [],
+      inspect: async () => ({ status: 'accepted', kind: 'registry', name: 'fixture-browser', version: '1.0.0', bundle: true }),
+      installBundle: async (spec, options) => {
+        assert.equal(spec, 'fixture-browser@1.0.0'); installs++;
+        bundles.push({ name: 'fixture-browser', version: '1.0.0', description: 'Browser automation', installed: true, enabled: options.enabled, availability: 'profile', rows: [] });
+        return { application: 'applied', bundle: 'fixture-browser', changed: true };
+      },
+      cancelInstall: async () => ({ status: 'not-running' }), setBundleEnabled: async () => ({}), setPluginEnabled: async () => ({}),
+    },
+    tools: { view: agent => { assert.ok(agent.id); return { visible: new Map(['browser_open', 'browser_click', 'browser_screenshot'].map(name => [name, {}])) }; }, wireSchemas: () => ({ schemas: [{ name: 'run_code' }] }), modeFor: () => 'ptc' },
+  };
+  const f = await fixture(t, { services });
+  const call = async (method, path, body) => {
+    const result = await f.call(path, method === 'GET' ? undefined : body);
+    if (result.code !== 200) throw Object.assign(new Error(result.body.error), { status: result.code });
+    return result.body;
+  };
+  const config = { taskType: 'browser', plugins: [{ spec: 'fixture-browser@1.0.0', enabled: true }] };
+  const options = { apply: true, stateFile: join(f.dir, 'prepare-state.json'), call };
+  const first = await prepare(config, options);
+  assert.equal(first.status, 'configured-needs-session-smoke-test'); assert.equal(installs, 1);
+  const second = await prepare(config, options); assert.equal(second.operations[0].requestId, first.operations[0].requestId); assert.equal(installs, 1);
+  bundles[0].enabled = false;
+  const drift = await prepare(config, options); assert.equal(drift.status, 'needs-attention'); assert.equal(installs, 1);
+  bundles[0].enabled = true;
+  const { id } = await f.create({ requirements: ['browser.navigate', 'browser.interact', 'browser.screenshot'] });
+  const readback = await f.call(`/v1/sessions/${id}/capabilities`);
+  assert.equal(readback.body.tools.length, 3); assert.deepEqual(readback.body.wireTools, ['run_code']);
+  assert.ok(readback.body.requirements.every(row => row.state === 'registered-needs-smoke-test'));
+  assert.equal((await f.call('/v1/health')).body.capabilities.pluginInstall, true);
+  assert.equal((await f.call('/v1/sessions/foreign/capabilities')).code, 403);
+});
+
+test('per-round reassessment uses real HTTP readbacks without prompting or applying configuration', async t => {
+  let names = ['read'];
+  const f = await fixture(t, { services: {
+    pluginManager: { listBundles: () => [], listPlugins: () => [] },
+    tools: { view: () => ({ visible: new Map(names.map(name => [name, {}])) }) },
+    agentPresets: { compositionInventory: () => [], remoteExportList: () => ({ presets: [{ id: 'standard', isDefault: true }] }) },
+  } });
+  const { id } = await f.create({ agentPreset: 'standard', modelSelection: { provider: 'fixture', model: 'flash', reasoningEffort: 'low' } });
+  const call = async (method, path, payload) => {
+    assert.ok(method === 'GET' || path === '/v1/capabilities/plan');
+    const result = await f.call(path, method === 'GET' ? undefined : payload);
+    if (result.code !== 200) throw new Error(result.body.error);
+    return result.body;
+  };
+  const input = { taskId: 'fixture-task', roundId: 'first', phase: 'implementation', taskType: 'custom', requirements: ['files.read'], sessionId: id, currentPreset: 'standard',
+    decisions: Object.fromEntries(['plugins', 'model', 'reasoning', 'preset'].map(key => [key, { action: 'keep', reason: '本轮读回支持沿用' }])) };
+  const first = await reassess(input, { call });
+  assert.equal(first.status, 'reviewed');
+  names = [];
+  const second = await reassess({ ...input, roundId: 'second', phase: 'check' }, { call, previous: first });
+  assert.ok(second.delta.includes('toolNames'));
+  assert.ok(second.findings.some(row => row.code === 'capability-gap'));
+  assert.equal(f.counts().admissions, 0);
+});
 
 test('authentication, browser rejection, and foreign session protection', async t => {
   const f = await fixture(t);
@@ -215,4 +286,97 @@ test('installed v4 direct tool message is summarized without a nested block', as
   const result = await f.call(`/v1/sessions/${id}/status?includeToolOutput=true`);
   assert.equal(result.code, 200);
   assert.deepEqual(result.body.task.recentToolOutputs[0], { seq: 2, callId: 'actual-v4-call', isError: false, tail: 'execution.json\ntask.json', truncated: false });
+});
+
+test('explicit session model selection validates catalog and reads back without saving defaults', async t => {
+  const f = await fixture(t);
+  const selection = { provider: 'fixture', model: 'flash', reasoningEffort: 'low' };
+  const { id } = await f.create({ modelSelection: selection });
+  assert.deepEqual((await f.call(`/v1/sessions/${id}/model`)).body.next, selection);
+  assert.deepEqual((await f.call('/v1/catalog')).body.capabilities.selectionScope, 'session');
+  for (const invalid of [
+    { ...selection, model: 'missing' }, { ...selection, provider: 'missing' },
+    { ...selection, reasoningEffort: 'turbo' }, { model: 'flash' }, { ...selection, token: 'secret' },
+  ]) {
+    assert.equal((await f.call('/v1/sessions', { requestId: randomUUID(), cwd: f.dir, title: 'invalid', modelSelection: invalid })).code, 400);
+  }
+  assert.equal(f.counts().creations, 1);
+  const prompt = { requestId: randomUUID(), text: 'task' };
+  await f.call(`/v1/sessions/${id}/prompt`, prompt);
+  assert.equal((await f.call(`/v1/sessions/${id}/status`)).body.task.modelVerified, null);
+  const events = f.logs.get(id);
+  events.push({ type: 'request/header', seq: events.length, data: { header: { config: { ...selection, apiKey: 'must-not-leak' } } } });
+  const status = await f.call(`/v1/sessions/${id}/status`);
+  assert.equal(status.body.task.modelVerified, true);
+  assert.equal(JSON.stringify(status).includes('must-not-leak'), false);
+  events.push({ type: 'request/header', seq: events.length, data: { header: { config: { ...selection, model: 'pro' } } } });
+  assert.equal((await f.call(`/v1/sessions/${id}/status`)).body.task.modelVerified, false);
+});
+
+test('unsupported Host keeps default creation but rejects explicit selection', async t => {
+  const f = await fixture(t, { unsupported: true });
+  await f.create();
+  assert.equal((await f.call('/v1/health')).body.capabilities.sessionModelSelection, false);
+  assert.equal((await f.call('/v1/sessions', { requestId: randomUUID(), cwd: f.dir, title: 'explicit', modelSelection: { provider: 'fixture', model: 'flash' } })).code, 501);
+});
+
+test('idle model changes are owned, idempotent, conflict checked and never replay old settings', async t => {
+  const f = await fixture(t), { id } = await f.create();
+  const path = `/v1/sessions/${id}/model`;
+  const body = { requestId: randomUUID(), modelSelection: { provider: 'fixture', model: 'pro', reasoningEffort: 'max' } };
+  assert.equal((await f.call('/v1/sessions/foreign/model', body)).code, 403);
+  assert.equal((await f.call(path, body)).code, 200);
+  assert.equal((await f.call(path, { ...body, modelSelection: { ...body.modelSelection, reasoningEffort: 'low' } })).code, 409);
+  const later = { requestId: randomUUID(), modelSelection: { provider: 'fixture', model: 'flash', reasoningEffort: 'off' } };
+  assert.equal((await f.call(path, later)).code, 200);
+  assert.equal((await f.call(path, body)).body.current.next.model, 'flash');
+  const events = f.logs.get(id);
+  events.push({ type: 'model/selection', seq: events.length, data: body.modelSelection });
+  assert.equal((await f.call(`/v1/sessions/${id}/prompt`, { requestId: randomUUID(), text: 'task' })).code, 409);
+  await f.call(path, { ...later, requestId: randomUUID() });
+  await f.call(`/v1/sessions/${id}/prompt`, { requestId: randomUUID(), text: 'task' });
+  assert.equal((await f.call(path, { ...body, requestId: randomUUID() })).code, 409);
+  f.agents.get(id).status = 'idle';
+  assert.equal((await f.call(path, { ...body, requestId: randomUUID() })).code, 409);
+});
+
+test('normalization cannot silently substitute a requested route or effort', async t => {
+  const f = await fixture(t);
+  f.ctx.get = () => ({ resolveCallConfig: async () => ({ provider: 'fixture', model: 'pro', reasoningEffort: 'max' }) });
+  // 适配器捕获的是启动时的服务对象；重启模拟不同 Host 的解析行为。
+  await f.bridge.close();
+  const bridge = await startBridge(f.ctx, { port: 0, stateDir: f.dir });
+  t.after(() => bridge.close());
+  const response = await fetch(bridge.origin + '/v1/sessions', { method: 'POST', headers: { Authorization: `Bearer ${bridge.token}`, 'Content-Type': 'application/json' }, body: JSON.stringify({ requestId: randomUUID(), cwd: f.dir, title: 'reject substitution', modelSelection: { provider: 'fixture', model: 'flash', reasoningEffort: 'low' } }) });
+  assert.equal(response.status, 409);
+  assert.equal(f.counts().creations, 0);
+});
+
+test('durable pending selection survives unmatched headers and retires only on exact use', () => {
+  const choice = { provider: 'fixture', model: 'pro', reasoningEffort: 'max' };
+  const events = [
+    { type: 'model/selection', seq: 0, data: choice },
+    { type: 'request/header', seq: 1, data: { header: { config: { ...choice, reasoningEffort: 'low' } } } },
+  ];
+  assert.deepEqual(selectionView(events).pending, choice);
+  events.push({ type: 'request/header', seq: 2, data: { header: { config: choice } } });
+  assert.deepEqual(selectionView(events), { next: choice, lastUsed: choice, pending: null });
+});
+
+test('selection intent and per-request expectation survive bridge restart', async t => {
+  const f = await fixture(t), choice = { provider: 'fixture', model: 'flash', reasoningEffort: 'low' };
+  const { id, packet } = await f.create({ modelSelection: choice });
+  const prompt = { requestId: randomUUID(), text: 'task' };
+  await f.call(`/v1/sessions/${id}/prompt`, prompt);
+  await f.bridge.close();
+  const bridge = await startBridge(f.ctx, { port: 0, stateDir: f.dir });
+  t.after(() => bridge.close());
+  const response = await fetch(bridge.origin + `/v1/sessions/${id}/status`, { headers: { Authorization: `Bearer ${bridge.token}` } });
+  const value = await response.json();
+  assert.deepEqual(value.modelSelection.requested, choice);
+  assert.deepEqual(value.modelSelection.next, choice);
+  assert.deepEqual(value.task.modelExpected, choice);
+  const retry = await fetch(bridge.origin + '/v1/sessions', { method: 'POST', headers: { Authorization: `Bearer ${bridge.token}`, 'Content-Type': 'application/json' }, body: JSON.stringify(packet) });
+  assert.equal(retry.status, 200);
+  assert.equal(f.counts().creations, 1);
 });

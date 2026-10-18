@@ -14,7 +14,7 @@ let packed;
 if (npmCli) packed = execFileSync(process.execPath, [npmCli, 'pack', '--json', '--pack-destination', dist], { cwd: join(root, 'plugin'), encoding: 'utf8' });
 else throw new Error('Run packaging through npm run pack.');
 const pkg = JSON.parse(packed)[0];
-for (const file of pkg.files) if (!/^(src\/|scripts\/client\.mjs$|README\.md$|LICENSE$|package\.json$|cordis\.patch\.yml$)/.test(file.path)) throw new Error(`Unexpected plugin file: ${file.path}`);
+for (const file of pkg.files) if (!/^(src\/|scripts\/(?:client|prepare|reassess)\.mjs$|README\.md$|LICENSE$|package\.json$|cordis\.patch\.yml$)/.test(file.path)) throw new Error(`Unexpected plugin file: ${file.path}`);
 // 使用 ZIP 的 STORE 格式，无外部依赖；源码体积小，不需要压缩。
 function crc32(data) {
   let crc = 0xffffffff;

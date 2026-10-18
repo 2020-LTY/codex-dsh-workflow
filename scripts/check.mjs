@@ -35,7 +35,9 @@ export async function check() {
   const entry = await readFile(join(skillPath, 'SKILL.md'), 'utf8');
   if (!/^---\r?\nname: dsh-delegate\r?\ndescription:/m.test(entry)) throw new Error('Invalid skill frontmatter');
   for (const match of entry.matchAll(/\]\((references\/[^)]+)\)/g)) await readFile(join(skillPath, match[1].split('#')[0]));
-  if (!(await readFile(join(root, 'plugin/scripts/client.mjs'))).equals(await readFile(join(skillPath, 'scripts/client.mjs')))) throw new Error('Skill client differs from plugin client');
+  for (const name of ['client.mjs', 'prepare.mjs', 'reassess.mjs']) {
+    if (!(await readFile(join(root, 'plugin/scripts', name))).equals(await readFile(join(skillPath, 'scripts', name)))) throw new Error(`Skill helper differs from plugin helper: ${name}`);
+  }
   console.log(`Privacy and skill checks passed (${files.length} source files).`);
   return files;
 }
